@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -131,8 +133,9 @@ kvmpa(uint64 va)
   uint64 off = va % PGSIZE;
   pte_t *pte;
   uint64 pa;
-  
-  pte = walk(kernel_pagetable, va, 0);
+  struct proc *p = myproc();
+
+  pte = walk(p->kpagetable, va, 0);
   if(pte == 0)
     panic("kvmpa");
   if((*pte & PTE_V) == 0)
@@ -142,6 +145,7 @@ kvmpa(uint64 va)
 }
 
 // Create PTEs for virtual addresses starting at va that refer to
+// physical addresses starting at pa. va and size might not
 // physical addresses starting at pa. va and size might not
 // be page-aligned. Returns 0 on success, -1 if walk() couldn't
 // allocate a needed page-table page.
@@ -269,6 +273,20 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   return newsz;
 }
 
+uint64
+vmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int do_free)
+{
+  if(newsz >= oldsz)
+    return oldsz;
+
+  if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
+    int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
+    uvmunmap(pagetable, PGROUNDUP(newsz), npages, do_free);
+  }
+
+  return newsz;
+}
+
 // Recursively free page-table pages.
 // All leaf mappings must already have been removed.
 void
@@ -379,23 +397,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
-  uint64 n, va0, pa0;
-
-  while(len > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > len)
-      n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  return copyin_new(pagetable, dst, srcva, len);
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -405,38 +407,108 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
-  uint64 n, va0, pa0;
-  int got_null = 0;
+  return copyinstr_new(pagetable, dst, srcva, max);
+}
 
-  while(got_null == 0 && max > 0){
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (srcva - va0);
-    if(n > max)
-      n = max;
-
-    char *p = (char *) (pa0 + (srcva - va0));
-    while(n > 0){
-      if(*p == '\0'){
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
+void
+vmprint(pagetable_t pagetable, int level)
+{
+  //printf(".. ");
+  for(int i = 0; i < 512; i++){ 
+    pte_t pte = pagetable[i];
+   
+    if((pte & PTE_V) && ((pte & (PTE_R|PTE_W|PTE_X)) == 0)){
+	      for(int j = 0; j < level; j++)
+   	      {
+	    		printf(".. ");
+    	      }
+    	      printf("..");
+	      printf("%d: pte %p pa %p\n", i, pte, PTE2PA(pte));
+      	      // this PTE points to a lower-level page table.
+              uint64 child = PTE2PA(pte);
+	      vmprint((pagetable_t)child, level + 1);
     }
+    else if(pte & PTE_V)
+    { 
+     	for(int j = 0; j < level; j++)
+   	{
+		printf(".. ");
+    	}
+    	printf("..");
+	printf("%d: pte %p pa %p\n", i, pte, PTE2PA(pte));
+   }
+  }
+  //kfree((void*)pagetable);
+}
+/*int 
+u2kvmcopy(pagetable_t old, pagetable_t new, uint64 start, uint64 end)
+{
+	pte_t *pte;
+	uint64 pa, i;
+	uint flags;
+	*
+	 *PGROUNDUP 和 PGROUNDDOWN 是将地址舍入为 PGSIZE 的倍数的宏。这些一般用于获取页对齐地址。
+	 PGROUNDUP 会将地址四舍五入为 PGSIZE 的较高倍数，而 PGROUNDDOWN 会将其四舍五入为 PGSIZE 的较低倍数
+	 下面之所以会使用PGROUNDUP，可以举例说明，
+	 例如进程虚拟地址为0~4096，于是根据PGROUNDUP算出的i分别等于0, 1024,2048,4096,
+	 之后如果进程虚拟地址需要扩充到4100，那么4096这一页已经被map到页表中，只需要考虑4096的下一页即5110是否满足i < end，
+	 如果满足，则map 4096的下一页5110
+	 */	
+/*	for(i = PGROUNDUP(start); i < end; i += PGSIZE)
+	{
+		if((pte = walk(old, i, 0)) == 0)
+			panic("u2kvmcopy : pte should exist");
+		if((*pte & PTE_V) == 0)
+			panic("u2kvmcopy : page not present");
+		pa = PTE2PA(*pte);
+		flags = PTE_FLAGS(*pte) & (~PTE_U);
+		if(mappages(new, i, PGSIZE, pa, flags) != 0)
+			goto err;
+	}
+	return 0;
+err:
+	uvmunmap(new, start, (i - start)/PGSIZE, 0);
+	return -1;
+}*/
+/*int
+u2kvmcopy(pagetable_t old, pagetable_t new, uint64 start, uint64 end)
+{
+  pte_t *pte;
+  uint64 pa, i;
+  uint flags;
 
-    srcva = va0 + PGSIZE;
+  for(i=PGROUNDUP(start); i<end; i+=PGSIZE){
+    if((pte = walk(old, i, 0)) == 0)
+      panic("u2kvmcopy: pte should exist");
+    if((*pte & PTE_V) == 0)
+      panic("u2kvmcopy: page not present");
+    pa = PTE2PA(*pte);
+    ** 需要将PTE_U标记位置0，内核才能访问用户态页表 */
+    /*flags = PTE_FLAGS(*pte) & (~PTE_U);
+
+    if(mappages(new, i, PGSIZE, pa, flags) != 0)
+      goto err;
   }
-  if(got_null){
-    return 0;
-  } else {
-    return -1;
-  }
+  return 0;
+
+ err:
+  ** 注意不要释放用户态页表物理空间 */
+  /*uvmunmap(new, start, (i-start)/PGSIZE, 0);
+  return -1;
+}*/
+void
+u2kvmcopy(pagetable_t u, pagetable_t k, uint64 start, uint64 end){
+  pte_t *user;
+  pte_t *kernel;
+  for(uint64 i = start; i < end; i += PGSIZE)
+  {
+    user = walk(u, i, 0);
+    kernel = walk(k, i, 1);
+/*
+    根据内核态页表的特点--直接映射到物理内存
+    我们无需使用mappage建立映射
+    记得消除PTE_U标志位
+*/    
+    *kernel = (*user) & (~PTE_U);
+  } 
 }

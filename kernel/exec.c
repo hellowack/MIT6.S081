@@ -36,8 +36,8 @@ exec(char *path, char **argv)
     goto bad;
 
   if((pagetable = proc_pagetable(p)) == 0)
-    goto bad;
-
+   goto bad;
+  
   // Load program into memory.
   for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
     if(readi(ip, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
@@ -55,6 +55,8 @@ exec(char *path, char **argv)
     if(ph.vaddr % PGSIZE != 0)
       goto bad;
     if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
+      goto bad;
+    if(sz1 >= PLIC)
       goto bad;
   }
   iunlockput(ip);
@@ -116,13 +118,21 @@ exec(char *path, char **argv)
   p->trapframe->sp = sp; // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
 
+ // uvmunmap(p->kpagetable, 0, PGROUNDUP(oldsz) / PGSIZE, 0);
+  u2kvmcopy(p->pagetable, p->kpagetable, 0, p->sz);
+  
+  if(p->pid == 1)
+  {
+	  printf("page table %p\n", p->pagetable);
+	  vmprint(p->pagetable, 0);
+  }
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 
  bad:
   if(pagetable)
     proc_freepagetable(pagetable, sz);
   if(ip){
-    iunlockput(ip);
+    iunlockput(ip);	
     end_op();
   }
   return -1;
